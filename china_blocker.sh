@@ -10,11 +10,17 @@ IPSET_CONF="$CONFIG_DIR/ipset.conf"
 WHITELIST_FILE="$CONFIG_DIR/whitelist.txt"
 LOG_FILE="/var/log/china_blocker.log"
 IP_SOURCE="https://www.ipdeny.com/ipblocks/data/countries/cn.zone"
+
 SERVICE_NAME="china_blocker"
+UPDATE_SERVICE_NAME="china_blocker-update"
+UPDATE_TIMER_NAME="china_blocker-update"
 
 CHAIN_NAME="CHINA_BLOCKER"
 IPSET_NAME="china_ips"
 IPSET_TMP="china_ips_new"
+
+# Timer 计划：每月 1 日 04:00
+ON_CALENDAR="*-*-01 04:00:00"
 
 # ================= 颜色定义 =================
 RED='\033[0;31m'
@@ -38,7 +44,7 @@ touch "$LOG_FILE" 2>/dev/null || true
 
 # ================= 工具函数 =================
 function check_dependencies() {
-    for cmd in ipset iptables curl awk sed sort uniq; do
+    for cmd in ipset iptables curl awk sed sort uniq systemctl; do
         if ! command -v "$cmd" &> /dev/null; then
             echo -e "${YELLOW}未检测到 $cmd，正在自动安装...${NC}"
             if [ -x "$(command -v apt-get)" ]; then
@@ -54,7 +60,7 @@ function check_dependencies() {
 }
 
 function ensure_ipset() {
-    # 不使用 ipset restore（你的 ipset restore 不支持 exist），只保证集合存在
+    # 不使用 ipset restore（你环境的 ipset restore 不支持 exist），只保证集合存在
     ipset create "$IPSET_NAME" hash:net -exist 2>/dev/null || true
 }
 
@@ -296,39 +302,12 @@ function clean_all() {
     remove_whitelist_rules
 }
 
-# --- 自动安装与自我复制 ---
-function install_service() {
-    echo -e "${CYAN}正在安装服务...${NC}"
-
-    check_dependencies
-    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-    touch "$LOG_FILE" 2>/dev/null || true
-
-    # 先复制脚本到目标路径，保证后续 systemd/cron 都指向正确文件
-    local SELF
-    SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
-    if ! cp "$SELF" "$TARGET_PATH" 2>/dev/null; then
-        echo -e "${RED}复制脚本失败：无法从 $SELF 复制到 $TARGET_PATH${NC}"
-        echo -e "${YELLOW}如果你是用 bash <(curl ...) 方式运行，请先保存为文件再执行。${NC}"
-        return
-    fi
-    chmod +x "$TARGET_PATH"
-    echo -e "脚本已部署到: ${GREEN}$TARGET_PATH${NC}"
-
-    # ★ 安装/修复时自动更新一次 IP 库，并在成功时提示数量
-    echo -e "${CYAN}安装过程中自动更新一次 IP 库...${NC}"
-    if update_ips; then
-        local COUNT
-        COUNT="$(get_ipset_count)"
-        COUNT="${COUNT:-unknown}"
-        echo -e "${GREEN}✅ 安装前置更新完成：当前中国 IP 库条目数 = $COUNT${NC}"
-    else
-        echo -e "${YELLOW}提示：本次自动更新失败（网络或源站问题）。安装仍继续，你可稍后手动更新。${NC}"
-    fi
-
-    # 生成 systemd
+# --- systemd 单元/定时器安装 ---
+function install_systemd_units() {
     local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+    local UPDATE_SERVICE_FILE="/etc/systemd/system/${UPDATE_SERVICE_NAME}.service"
+    local UPDATE_TIMER_FILE="/etc/systemd/system/${UPDATE_TIMER_NAME}.timer"
+
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=China IP Blocker Service
@@ -347,30 +326,101 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
+    cat > "$UPDATE_SERVICE_FILE" <<EOF
+[Unit]
+Description=China Blocker - Update China IPSet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$TARGET_PATH --update
+StandardOutput=journal
+StandardError=journal
+EOF
+
+    cat > "$UPDATE_TIMER_FILE" <<EOF
+[Unit]
+Description=China Blocker - Monthly Update Timer
+
+[Timer]
+OnCalendar=$ON_CALENDAR
+Persistent=true
+Unit=${UPDATE_SERVICE_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# --- 自动安装与自我复制 ---
+function install_service() {
+    echo -e "${CYAN}正在安装服务...${NC}"
+
+    check_dependencies
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null || true
+
+    # 复制脚本到目标路径
+    local SELF
+    SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+    if ! cp "$SELF" "$TARGET_PATH" 2>/dev/null; then
+        echo -e "${RED}复制脚本失败：无法从 $SELF 复制到 $TARGET_PATH${NC}"
+        echo -e "${YELLOW}如果你是用 bash <(curl ...) 方式运行，请先保存为文件再执行。${NC}"
+        return
+    fi
+    chmod +x "$TARGET_PATH"
+    echo -e "脚本已部署到: ${GREEN}$TARGET_PATH${NC}"
+
+    # 安装过程中自动更新一次 IP 库，并提示数量
+    echo -e "${CYAN}安装过程中自动更新一次 IP 库...${NC}"
+    if update_ips; then
+        local COUNT
+        COUNT="$(get_ipset_count)"
+        COUNT="${COUNT:-unknown}"
+        echo -e "${GREEN}✅ 安装前置更新完成：当前中国 IP 库条目数 = $COUNT${NC}"
+    else
+        echo -e "${YELLOW}提示：本次自动更新失败（网络或源站问题）。安装仍继续，你可稍后手动更新。${NC}"
+    fi
+
+    # 写入 systemd unit + timer
+    install_systemd_units
+
     systemctl daemon-reload
+
+    # 开机恢复服务
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
     systemctl start "$SERVICE_NAME" >/dev/null 2>&1
 
-    (crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME"; echo "0 4 1 * * $TARGET_PATH --update >> $LOG_FILE 2>&1") | crontab -
+    # 定时更新 timer
+    systemctl enable "${UPDATE_TIMER_NAME}.timer" >/dev/null 2>&1
+    systemctl start "${UPDATE_TIMER_NAME}.timer" >/dev/null 2>&1
 
     echo -e "${GREEN}✅ 安装完成！${NC}"
     echo -e "服务已启动并设置为开机自启。"
     echo -e "${GREEN}现在可直接开始屏蔽端口：菜单选择 3（屏蔽端口）${NC}"
+    echo -e "${CYAN}已启用 systemd timer：$ON_CALENDAR 自动更新 IP 库（Persistent=true）${NC}"
     echo -e "提示：你现在可以删除当前的下载文件，因为脚本已复制到系统目录。"
 }
 
 function uninstall_all() {
     echo -e "${YELLOW}正在卸载...${NC}"
+
+    systemctl stop "${UPDATE_TIMER_NAME}.timer" 2>/dev/null
+    systemctl disable "${UPDATE_TIMER_NAME}.timer" 2>/dev/null
+    rm -f "/etc/systemd/system/${UPDATE_TIMER_NAME}.timer" 2>/dev/null
+    rm -f "/etc/systemd/system/${UPDATE_SERVICE_NAME}.service" 2>/dev/null
+
     systemctl stop "$SERVICE_NAME" 2>/dev/null
     systemctl disable "$SERVICE_NAME" 2>/dev/null
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null
+
     systemctl daemon-reload 2>/dev/null
 
     clean_all
     rm -rf "$CONFIG_DIR"
     rm -f "$TARGET_PATH"
-
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME" | crontab -
 
     echo -e "${GREEN}卸载完成。${NC}"
     exit 0
@@ -402,6 +452,11 @@ function show_menu() {
         5) vim "$WHITELIST_FILE"; apply_whitelist ;;
         6)
             systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || true
+            echo -e "\n${CYAN}--- timer 状态 ---${NC}"
+            systemctl status "${UPDATE_TIMER_NAME}.timer" --no-pager 2>/dev/null || true
+            echo -e "\n${CYAN}--- 未来计划（systemd timers）---${NC}"
+            systemctl list-timers --all | grep -E "${UPDATE_TIMER_NAME}\.timer" || true
+
             echo -e "\n${CYAN}--- iptables（INPUT 中与本工具相关）---${NC}"
             iptables -S INPUT | grep -E "$CHAIN_NAME|ACCEPT" || true
             echo -e "\n${CYAN}--- $CHAIN_NAME 链规则 ---${NC}"
