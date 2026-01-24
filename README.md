@@ -51,11 +51,10 @@
 
 ### 1) 下载并运行
 
-把脚本保存为 `china_blocker`（或任意文件名），然后：
-
 ```
-chmod +x china_blocker
-sudo ./china_blocker
+curl -fsSL https://raw.githubusercontent.com/Henry00123/china_blocker/main/china_blocker.sh -o china_blocker.sh
+chmod +x china_blocker.sh
+sudo ./china_blocker.sh
 ```
 
 进入交互式菜单后：
