@@ -236,16 +236,12 @@ pick_editor() {
 # ================== 关键：CIDR 抽取器（更强健） ==================
 # 从任意文本里提取 IPv4(/mask) token（避免 CR/BOM/杂字符导致整行匹配失败）
 extract_cidr_tokens() {
-  # stdin -> stdout
-  # 说明：不校验每段 <=255（ipdeny 正常数据无需校验），可大幅增强解析成功率
   grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' \
     | grep -vE '^0\.0\.0\.0(/0)?$' \
     | sort -u
 }
 
 looks_like_html() {
-  # 参数：文件
-  # 返回 0 表示像 HTML
   local f="$1"
   if grep -qiE '<!doctype|<html|</html>' "$f"; then
     return 0
@@ -266,10 +262,10 @@ update_ips() {
   ensure_ipset
   ipset destroy "$IPSET_TMP" 2>/dev/null || true
 
-  local TMP_FILE CLEAN_FILE
+  local TMP_FILE="" CLEAN_FILE=""
   TMP_FILE="$(mktemp)"
   CLEAN_FILE="$(mktemp)"
-  trap 'rm -f "$TMP_FILE" "$CLEAN_FILE"' RETURN
+  trap 'rm -f "${TMP_FILE:-}" "${CLEAN_FILE:-}"' RETURN
 
   local CURL_OPTS=( -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 --retry-all-errors )
 
@@ -298,7 +294,6 @@ update_ips() {
   if ! [ -s "$CLEAN_FILE" ]; then
     echo -e "${YELLOW}ipdeny 下载或解析失败，切换 APNIC 备用源生成 CN IPv4 CIDR...${NC}"
     if curl "${CURL_OPTS[@]}" -o "$TMP_FILE" "$APNIC_URL"; then
-      # mawk 兼容：不用函数局部变量、不用浮点 log
       awk -F'|' '
         $2=="CN" && $3=="ipv4" {
           c = $5 + 0
