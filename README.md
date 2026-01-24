@@ -52,9 +52,7 @@
 ### 1) 下载并运行
 
 ```
-curl -fsSL https://raw.githubusercontent.com/Henry00123/china_blocker/main/china_blocker.sh -o china_blocker.sh
-chmod +x china_blocker.sh
-sudo ./china_blocker.sh
+curl -fsSL https://raw.githubusercontent.com/Henry00123/china_blocker/main/china_blocker.sh -o china_blocker.sh && chmod +x china_blocker.sh && sudo ./china_blocker.sh
 ```
 
 进入交互式菜单后：
