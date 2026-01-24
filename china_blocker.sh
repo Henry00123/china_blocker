@@ -1,0 +1,443 @@
+#!/bin/bash
+
+# ================= 配置区 =================
+INSTALL_DIR="/usr/local/bin"
+SCRIPT_NAME="china_blocker"
+TARGET_PATH="$INSTALL_DIR/$SCRIPT_NAME"
+
+CONFIG_DIR="/etc/china_blocker"
+IPSET_CONF="$CONFIG_DIR/ipset.conf"
+WHITELIST_FILE="$CONFIG_DIR/whitelist.txt"
+LOG_FILE="/var/log/china_blocker.log"
+IP_SOURCE="https://www.ipdeny.com/ipblocks/data/countries/cn.zone"
+SERVICE_NAME="china_blocker"
+
+CHAIN_NAME="CHINA_BLOCKER"
+IPSET_NAME="china_ips"
+IPSET_TMP="china_ips_new"
+
+# ================= 颜色定义 =================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ================= 基础检查 =================
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}错误：请使用 sudo 运行此脚本。${NC}"
+    exit 1
+fi
+
+mkdir -p "$CONFIG_DIR"
+if [ ! -f "$WHITELIST_FILE" ]; then
+    touch "$WHITELIST_FILE"
+    echo "# 在此处每行添加一个要放行的IP地址" > "$WHITELIST_FILE"
+fi
+touch "$LOG_FILE" 2>/dev/null || true
+
+# ================= 工具函数 =================
+function check_dependencies() {
+    for cmd in ipset iptables curl awk sed sort uniq; do
+        if ! command -v "$cmd" &> /dev/null; then
+            echo -e "${YELLOW}未检测到 $cmd，正在自动安装...${NC}"
+            if [ -x "$(command -v apt-get)" ]; then
+                apt-get update -qq && apt-get install -y "$cmd" >/dev/null
+            elif [ -x "$(command -v yum)" ]; then
+                yum install -y "$cmd" >/dev/null
+            else
+                echo -e "${RED}自动安装失败，请手动安装 $cmd${NC}"
+                exit 1
+            fi
+        fi
+    done
+}
+
+function ensure_ipset() {
+    # 不使用 ipset restore（你的 ipset restore 不支持 exist），只保证集合存在
+    ipset create "$IPSET_NAME" hash:net -exist 2>/dev/null || true
+}
+
+function ensure_chain() {
+    iptables -N "$CHAIN_NAME" 2>/dev/null || true
+    if ! iptables -C INPUT -j "$CHAIN_NAME" 2>/dev/null; then
+        iptables -I INPUT 2 -j "$CHAIN_NAME"
+    fi
+}
+
+function apply_whitelist() {
+    grep -vE "^\s*#|^\s*$" "$WHITELIST_FILE" | while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if ! iptables -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; then
+            iptables -I INPUT 1 -s "$ip" -j ACCEPT
+        fi
+    done
+}
+
+function remove_whitelist_rules() {
+    [ ! -f "$WHITELIST_FILE" ] && return
+    grep -vE "^\s*#|^\s*$" "$WHITELIST_FILE" | while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        while iptables -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; do
+            iptables -D INPUT -s "$ip" -j ACCEPT 2>/dev/null || break
+        done
+    done
+}
+
+function save_ipset() {
+    {
+        echo "create $IPSET_NAME hash:net -exist"
+        echo "flush $IPSET_NAME"
+        ipset list "$IPSET_NAME" 2>/dev/null | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}\// {print "add '"$IPSET_NAME"' " $1 " -exist"}'
+    } > "$IPSET_CONF" 2>/dev/null || true
+}
+
+function restore_ipset_from_conf() {
+    if [ -f "$IPSET_CONF" ]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            ipset $line 2>/dev/null || true
+        done < "$IPSET_CONF"
+    else
+        ensure_ipset
+    fi
+}
+
+function get_ipset_count() {
+    ipset list "$IPSET_NAME" 2>/dev/null | awk -F': ' '/Number of entries/ {print $2; exit}'
+}
+
+function list_blocked_ports() {
+    iptables -S "$CHAIN_NAME" 2>/dev/null \
+    | awk '
+        /--dport/ {
+            for (i=1; i<=NF; i++) if ($i=="--dport") print $(i+1)
+        }' \
+    | sort -n | uniq
+}
+
+# ================= 核心功能函数 =================
+function restore_all() {
+    restore_ipset_from_conf
+    ensure_chain
+    apply_whitelist
+}
+
+function update_ips() {
+    echo -e "${CYAN}正在下载并更新 IP 库...${NC}"
+    ensure_ipset
+
+    ipset destroy "$IPSET_TMP" 2>/dev/null || true
+
+    local TMP_FILE CLEAN_FILE
+    TMP_FILE="$(mktemp)"
+    CLEAN_FILE="$(mktemp)"
+    trap 'rm -f "$TMP_FILE" "$CLEAN_FILE"' EXIT
+
+    if ! curl -fsS -o "$TMP_FILE" "$IP_SOURCE"; then
+        echo -e "${RED}下载失败，请检查网络。${NC}"
+        echo "[$(date)] Update failed: curl error" >> "$LOG_FILE"
+        return 1
+    fi
+
+    if ! [ -s "$TMP_FILE" ]; then
+        echo -e "${RED}下载内容为空，已中止更新。${NC}"
+        echo "[$(date)] Update failed: empty content" >> "$LOG_FILE"
+        return 1
+    fi
+
+    awk '
+        /^[ \t]*$/ { next }
+        /^[ \t]*#/ { next }
+        {
+          gsub(/\r/,"",$0);
+          if ($0 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?$/) print $0
+        }
+    ' "$TMP_FILE" > "$CLEAN_FILE"
+
+    if ! [ -s "$CLEAN_FILE" ]; then
+        echo -e "${RED}过滤后无有效 IP 段，已中止更新。${NC}"
+        echo "[$(date)] Update failed: no valid cidr after clean" >> "$LOG_FILE"
+        return 1
+    fi
+
+    ipset create "$IPSET_TMP" hash:net hashsize 4096 maxelem 1048576 -exist 2>/dev/null || true
+    ipset flush "$IPSET_TMP" 2>/dev/null || true
+
+    local added=0 skipped=0
+    while IFS= read -r cidr; do
+        if ipset add "$IPSET_TMP" "$cidr" -exist 2>/dev/null; then
+            added=$((added+1))
+        else
+            skipped=$((skipped+1))
+        fi
+    done < "$CLEAN_FILE"
+
+    ipset swap "$IPSET_TMP" "$IPSET_NAME"
+    ipset destroy "$IPSET_TMP" 2>/dev/null || true
+
+    save_ipset
+
+    local COUNT
+    COUNT="$(get_ipset_count)"
+    COUNT="${COUNT:-unknown}"
+
+    echo -e "${GREEN}更新成功！IP 总数：$COUNT（本次新增尝试：$added，跳过：$skipped）${NC}"
+    echo "[$(date)] Update success. Total: $COUNT, added_try=$added, skipped=$skipped" >> "$LOG_FILE"
+    return 0
+}
+
+function block_port() {
+    echo -n "输入要屏蔽的端口 (如 80): "
+    read -r port
+    [[ -z "$port" ]] && return
+
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo -e "${RED}端口无效：$port${NC}"
+        return
+    fi
+
+    if [[ "$port" == "22" ]]; then
+        echo -e "${RED}⚠️ 警告：屏蔽 22 端口可能导致你失去连接！${NC}"
+        echo -n "确认继续? (y/N): "
+        read -r confirm
+        [[ "$confirm" != "y" ]] && return
+    fi
+
+    ensure_ipset
+    ensure_chain
+
+    local added_protos=()
+    local existed_protos=()
+
+    for proto in tcp udp; do
+        if iptables -C "$CHAIN_NAME" -p "$proto" --dport "$port" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; then
+            existed_protos+=("$proto")
+        else
+            iptables -A "$CHAIN_NAME" -p "$proto" --dport "$port" -m set --match-set "$IPSET_NAME" src -j DROP
+            added_protos+=("$proto")
+        fi
+    done
+
+    apply_whitelist
+
+    # 避免重复显示：汇总输出
+    if [ "${#added_protos[@]}" -gt 0 ]; then
+        echo -e "${GREEN}已屏蔽端口 $port（仅中国 IP）: ${added_protos[*]}${NC}"
+    fi
+    if [ "${#added_protos[@]}" -eq 0 ] && [ "${#existed_protos[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}端口 $port 已经处于封禁状态（仅中国 IP）: ${existed_protos[*]}${NC}"
+    fi
+}
+
+function unblock_port() {
+    ensure_chain
+
+    mapfile -t ports < <(list_blocked_ports)
+    if [ "${#ports[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有已封禁的端口。${NC}"
+        return
+    fi
+
+    echo -e "${CYAN}已封禁端口列表（中国 IP 命中将 DROP）：${NC}"
+    for i in "${!ports[@]}"; do
+        printf "%2d) %s\n" "$((i+1))" "${ports[$i]}"
+    done
+
+    echo -n "请输入要解封的端口（可输入序号或端口号，回车取消）: "
+    read -r choice
+    [[ -z "$choice" ]] && return
+
+    local port=""
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        if (( choice >= 1 && choice <= ${#ports[@]} )); then
+            port="${ports[$((choice-1))]}"
+        else
+            port="$choice"
+        fi
+    else
+        echo -e "${RED}输入无效：$choice${NC}"
+        return
+    fi
+
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        echo -e "${RED}端口无效：$port${NC}"
+        return
+    fi
+
+    local removed_protos=()
+    for proto in tcp udp; do
+        local removed_this_proto=0
+        while iptables -C "$CHAIN_NAME" -p "$proto" --dport "$port" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; do
+            iptables -D "$CHAIN_NAME" -p "$proto" --dport "$port" -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null || break
+            removed_this_proto=1
+        done
+        [[ $removed_this_proto -eq 1 ]] && removed_protos+=("$proto")
+    done
+
+    if [ "${#removed_protos[@]}" -gt 0 ]; then
+        echo -e "${GREEN}已解封端口 $port: ${removed_protos[*]}${NC}"
+    else
+        echo -e "${YELLOW}端口 $port 未找到对应封禁规则（可能已被删除）。${NC}"
+    fi
+}
+
+function clean_all() {
+    while iptables -C INPUT -j "$CHAIN_NAME" 2>/dev/null; do
+        iptables -D INPUT -j "$CHAIN_NAME" 2>/dev/null || break
+    done
+
+    iptables -F "$CHAIN_NAME" 2>/dev/null || true
+    iptables -X "$CHAIN_NAME" 2>/dev/null || true
+
+    ipset destroy "$IPSET_NAME" 2>/dev/null || true
+    ipset destroy "$IPSET_TMP" 2>/dev/null || true
+
+    remove_whitelist_rules
+}
+
+# --- 自动安装与自我复制 ---
+function install_service() {
+    echo -e "${CYAN}正在安装服务...${NC}"
+
+    check_dependencies
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null || true
+
+    # 先复制脚本到目标路径，保证后续 systemd/cron 都指向正确文件
+    local SELF
+    SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+    if ! cp "$SELF" "$TARGET_PATH" 2>/dev/null; then
+        echo -e "${RED}复制脚本失败：无法从 $SELF 复制到 $TARGET_PATH${NC}"
+        echo -e "${YELLOW}如果你是用 bash <(curl ...) 方式运行，请先保存为文件再执行。${NC}"
+        return
+    fi
+    chmod +x "$TARGET_PATH"
+    echo -e "脚本已部署到: ${GREEN}$TARGET_PATH${NC}"
+
+    # ★ 安装/修复时自动更新一次 IP 库，并在成功时提示数量
+    echo -e "${CYAN}安装过程中自动更新一次 IP 库...${NC}"
+    if update_ips; then
+        local COUNT
+        COUNT="$(get_ipset_count)"
+        COUNT="${COUNT:-unknown}"
+        echo -e "${GREEN}✅ 安装前置更新完成：当前中国 IP 库条目数 = $COUNT${NC}"
+    else
+        echo -e "${YELLOW}提示：本次自动更新失败（网络或源站问题）。安装仍继续，你可稍后手动更新。${NC}"
+    fi
+
+    # 生成 systemd
+    local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=China IP Blocker Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$TARGET_PATH --restore
+ExecStop=$TARGET_PATH --clean
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+
+    (crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME"; echo "0 4 1 * * $TARGET_PATH --update >> $LOG_FILE 2>&1") | crontab -
+
+    echo -e "${GREEN}✅ 安装完成！${NC}"
+    echo -e "服务已启动并设置为开机自启。"
+    echo -e "${GREEN}现在可直接开始屏蔽端口：菜单选择 3（屏蔽端口）${NC}"
+    echo -e "提示：你现在可以删除当前的下载文件，因为脚本已复制到系统目录。"
+}
+
+function uninstall_all() {
+    echo -e "${YELLOW}正在卸载...${NC}"
+    systemctl stop "$SERVICE_NAME" 2>/dev/null
+    systemctl disable "$SERVICE_NAME" 2>/dev/null
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null
+    systemctl daemon-reload 2>/dev/null
+
+    clean_all
+    rm -rf "$CONFIG_DIR"
+    rm -f "$TARGET_PATH"
+
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME" | crontab -
+
+    echo -e "${GREEN}卸载完成。${NC}"
+    exit 0
+}
+
+# ================= 菜单与入口 =================
+function show_menu() {
+    clear
+    echo -e "${CYAN}==================================${NC}"
+    echo -e "${CYAN}   🇨🇳 中国 IP 屏蔽助手 (一键版)   ${NC}"
+    echo -e "${CYAN}==================================${NC}"
+    echo -e "1. ${GREEN}安装/修复服务${NC} (推荐，只需运行一次)"
+    echo -e "2. ${YELLOW}更新 IP 库${NC}"
+    echo -e "3. ${RED}屏蔽端口${NC}"
+    echo -e "4. ${GREEN}解封端口${NC}"
+    echo -e "5. 编辑白名单（vim）"
+    echo -e "6. 查看状态"
+    echo -e "7. ${RED}卸载服务${NC}"
+    echo -e "0. 退出"
+    echo -e "----------------------------------"
+    echo -n "请选择: "
+    read -r choice
+
+    case $choice in
+        1) install_service ;;
+        2) update_ips ;;
+        3) block_port ;;
+        4) unblock_port ;;
+        5) vim "$WHITELIST_FILE"; apply_whitelist ;;
+        6)
+            systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || true
+            echo -e "\n${CYAN}--- iptables（INPUT 中与本工具相关）---${NC}"
+            iptables -S INPUT | grep -E "$CHAIN_NAME|ACCEPT" || true
+            echo -e "\n${CYAN}--- $CHAIN_NAME 链规则 ---${NC}"
+            iptables -S "$CHAIN_NAME" 2>/dev/null || true
+            echo -e "\n${CYAN}--- 已封禁端口（去重）---${NC}"
+            list_blocked_ports 2>/dev/null || true
+            echo -e "\n${CYAN}--- ipset $IPSET_NAME 条目数 ---${NC}"
+            get_ipset_count 2>/dev/null || true
+        ;;
+        7) uninstall_all ;;
+        0) exit 0 ;;
+        *) echo "无效选择" ;;
+    esac
+
+    if [[ "$1" != "--no-loop" ]]; then
+        echo ""; read -p "按回车继续..." ; show_menu
+    fi
+}
+
+check_dependencies
+
+# systemd 调用（在目标路径且有参数）不显示菜单
+if [[ "$0" == "$TARGET_PATH" && -n "$1" ]]; then
+    case "$1" in
+        --restore) restore_all ;;
+        --clean)   clean_all ;;
+        --update)  update_ips ;;
+    esac
+    exit 0
+fi
+
+case "$1" in
+    --install) install_service ;;
+    --update)  update_ips ;;
+    --block)   block_port ;;
+    --restore) restore_all ;;
+    --clean)   clean_all ;;
+    *)         show_menu ;;
+esac
