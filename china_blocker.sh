@@ -79,12 +79,10 @@ pkg_install() {
 
 check_dependencies() {
     # 必需：ipset iptables curl awk sed sort uniq
-    # systemctl 用于 systemd 服务/定时器（主流发行版默认有）
     local need=(ipset iptables curl awk sed sort uniq)
     for cmd in "${need[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo -e "${YELLOW}未检测到 ${cmd}，尝试自动安装...${NC}"
-            # 兼容不同发行版/包名
             case "$cmd" in
                 iptables)
                     pkg_install iptables || pkg_install iptables-nft || true
@@ -100,28 +98,23 @@ check_dependencies() {
         fi
     done
 
-    # systemctl 可选，但你要用 systemd timer → 没有就提示并允许仅手动模式
     if ! command -v systemctl >/dev/null 2>&1; then
         echo -e "${YELLOW}未检测到 systemctl（系统可能非 systemd）。将无法安装为服务/定时器，但仍可手动运行。${NC}"
     fi
 }
 
 ensure_kernel_modules() {
-    # 某些精简系统可能没自动加载 ipset 相关模块
-    # 失败也不强制退出（让后续命令报错时更明确）
     modprobe ip_set 2>/dev/null || true
     modprobe ip_set_hash_net 2>/dev/null || true
 }
 
 ensure_ipset() {
     ensure_kernel_modules
-    # 统一不用 ipset restore，避免 v7.15 restore exist 兼容问题
     ipset create "$IPSET_NAME" hash:net -exist 2>/dev/null || true
 }
 
 ensure_chain() {
     iptables -N "$CHAIN_NAME" 2>/dev/null || true
-    # INPUT 第 2 条插入 jump（第 1 条留给白名单）
     if ! iptables -C INPUT -j "$CHAIN_NAME" 2>/dev/null; then
         iptables -I INPUT 2 -j "$CHAIN_NAME"
     fi
@@ -147,11 +140,9 @@ remove_whitelist_rules() {
 }
 
 save_ipset() {
-    # 保存为“可执行命令列表”，兼容所有 ipset 版本（不用 restore）
     {
         echo "create $IPSET_NAME hash:net -exist"
         echo "flush $IPSET_NAME"
-        # 只输出类似 1.2.3.4/xx 的 token（ipset list 输出第一列是 CIDR）
         ipset list "$IPSET_NAME" 2>/dev/null | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}\// {print "add '"$IPSET_NAME"' " $1 " -exist"}'
     } > "$IPSET_CONF" 2>/dev/null || true
 }
@@ -181,7 +172,6 @@ list_blocked_ports() {
 }
 
 pick_editor() {
-    # 你要求 vim：如果没有 vim，给出提示（可自行安装）
     if command -v vim >/dev/null 2>&1; then
         echo "vim"
     elif command -v vi >/dev/null 2>&1; then
@@ -210,7 +200,6 @@ update_ips() {
     CLEAN_FILE="$(mktemp)"
     trap 'rm -f "$TMP_FILE" "$CLEAN_FILE"' EXIT
 
-    # -L：跟随重定向；更稳
     if ! curl -fsSL -o "$TMP_FILE" "$IP_SOURCE"; then
         echo -e "${RED}下载失败，请检查网络。${NC}"
         echo "[$(date)] Update failed: curl error" >> "$LOG_FILE"
@@ -223,8 +212,7 @@ update_ips() {
         return 1
     fi
 
-    # ✅ 关键兼容：cn.zone 可能是“一行空格分隔 CIDR”，也可能“每行一个 CIDR”
-    # 先把所有空白打散成 token（每行一个），再过滤合法 IPv4/CIDR
+    # 兼容：一行空格分隔 / 多行分隔
     tr -s ' \t\r\n' '\n' < "$TMP_FILE" \
     | awk '
         /^[ \t]*$/ { next }
@@ -240,7 +228,6 @@ update_ips() {
         return 1
     fi
 
-    # 兼容模式：逐条导入临时集合，再 swap
     ipset create "$IPSET_TMP" hash:net hashsize 4096 maxelem 1048576 -exist 2>/dev/null || true
     ipset flush "$IPSET_TMP" 2>/dev/null || true
 
@@ -499,67 +486,70 @@ uninstall_all() {
     exit 0
 }
 
+# ================= 菜单（循环返回主菜单） =================
 show_menu() {
-    clear
-    echo -e "${CYAN}==================================${NC}"
-    echo -e "${CYAN}   🇨🇳 中国 IP 屏蔽助手 (一键版)   ${NC}"
-    echo -e "${CYAN}==================================${NC}"
-    echo -e "1. ${GREEN}安装/修复服务${NC} (推荐，只需运行一次)"
-    echo -e "2. ${YELLOW}更新 IP 库${NC}"
-    echo -e "3. ${RED}屏蔽端口${NC}"
-    echo -e "4. ${GREEN}解封端口${NC}"
-    echo -e "5. 编辑白名单（vim）"
-    echo -e "6. 查看状态"
-    echo -e "7. ${RED}卸载服务${NC}"
-    echo -e "0. 退出"
-    echo -e "----------------------------------"
-    echo -n "请选择: "
-    read -r choice
+    while true; do
+        clear
+        echo -e "${CYAN}==================================${NC}"
+        echo -e "${CYAN}   🇨🇳 中国 IP 屏蔽助手 (一键版)   ${NC}"
+        echo -e "${CYAN}==================================${NC}"
+        echo -e "1. ${GREEN}安装/修复服务${NC} (推荐，只需运行一次)"
+        echo -e "2. ${YELLOW}更新 IP 库${NC}"
+        echo -e "3. ${RED}屏蔽端口${NC}"
+        echo -e "4. ${GREEN}解封端口${NC}"
+        echo -e "5. 编辑白名单（vim）"
+        echo -e "6. 查看状态"
+        echo -e "7. ${RED}卸载服务${NC}"
+        echo -e "0. 退出"
+        echo -e "----------------------------------"
+        echo -n "请选择: "
+        read -r choice
 
-    case $choice in
-        1) install_service ;;
-        2) update_ips ;;
-        3) block_port ;;
-        4) unblock_port ;;
-        5)
-            local ed
-            ed="$(pick_editor)"
-            if [[ "$ed" == "vim" ]]; then
-                vim "$WHITELIST_FILE"
-                apply_whitelist
-            elif [[ -n "$ed" ]]; then
-                echo -e "${YELLOW}未安装 vim，使用 $ed 打开白名单文件。建议安装 vim：${NC}"
-                echo -e "  Debian/Ubuntu: sudo apt-get install -y vim"
-                echo -e "  CentOS/RHEL:   sudo yum/dnf install -y vim-enhanced"
-                "$ed" "$WHITELIST_FILE"
-                apply_whitelist
-            else
-                echo -e "${RED}未找到 vim/vi，无法编辑白名单。请先安装 vim。${NC}"
-            fi
-        ;;
-        6)
-            systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || true
-            echo -e "\n${CYAN}--- timer 状态 ---${NC}"
-            systemctl status "${UPDATE_TIMER_NAME}.timer" --no-pager 2>/dev/null || true
-            echo -e "\n${CYAN}--- 未来计划（systemd timers）---${NC}"
-            systemctl list-timers --all 2>/dev/null | grep -E "${UPDATE_TIMER_NAME}\.timer" || true
+        case $choice in
+            1) install_service ;;
+            2) update_ips ;;
+            3) block_port ;;
+            4) unblock_port ;;
+            5)
+                local ed
+                ed="$(pick_editor)"
+                if [[ "$ed" == "vim" ]]; then
+                    vim "$WHITELIST_FILE"
+                    apply_whitelist
+                elif [[ -n "$ed" ]]; then
+                    echo -e "${YELLOW}未安装 vim，使用 $ed 打开白名单文件。建议安装 vim：${NC}"
+                    echo -e "  Debian/Ubuntu: sudo apt-get install -y vim"
+                    echo -e "  CentOS/RHEL:   sudo yum/dnf install -y vim-enhanced"
+                    "$ed" "$WHITELIST_FILE"
+                    apply_whitelist
+                else
+                    echo -e "${RED}未找到 vim/vi，无法编辑白名单。请先安装 vim。${NC}"
+                fi
+            ;;
+            6)
+                systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || true
+                echo -e "\n${CYAN}--- timer 状态 ---${NC}"
+                systemctl status "${UPDATE_TIMER_NAME}.timer" --no-pager 2>/dev/null || true
+                echo -e "\n${CYAN}--- 未来计划（systemd timers）---${NC}"
+                systemctl list-timers --all 2>/dev/null | grep -E "${UPDATE_TIMER_NAME}\.timer" || true
 
-            echo -e "\n${CYAN}--- iptables（INPUT 中与本工具相关）---${NC}"
-            iptables -S INPUT | grep -E "$CHAIN_NAME|ACCEPT" || true
-            echo -e "\n${CYAN}--- $CHAIN_NAME 链规则 ---${NC}"
-            iptables -S "$CHAIN_NAME" 2>/dev/null || true
-            echo -e "\n${CYAN}--- 已封禁端口（去重）---${NC}"
-            list_blocked_ports 2>/dev/null || true
-            echo -e "\n${CYAN}--- ipset $IPSET_NAME 条目数 ---${NC}"
-            get_ipset_count 2>/dev/null || true
-        ;;
-        7) uninstall_all ;;
-        0) exit 0 ;;
-        *) echo "无效选择" ;;
-    esac
+                echo -e "\n${CYAN}--- iptables（INPUT 中与本工具相关）---${NC}"
+                iptables -S INPUT | grep -E "$CHAIN_NAME|ACCEPT" || true
+                echo -e "\n${CYAN}--- $CHAIN_NAME 链规则 ---${NC}"
+                iptables -S "$CHAIN_NAME" 2>/dev/null || true
+                echo -e "\n${CYAN}--- 已封禁端口（去重）---${NC}"
+                list_blocked_ports 2>/dev/null || true
+                echo -e "\n${CYAN}--- ipset $IPSET_NAME 条目数 ---${NC}"
+                get_ipset_count 2>/dev/null || true
+            ;;
+            7) uninstall_all ;;
+            0) exit 0 ;;
+            *) echo "无效选择" ;;
+        esac
 
-    echo ""
-    read -p "按回车继续..." _
+        echo ""
+        read -p "按回车返回主菜单..." _
+    done
 }
 
 # ================= 入口 =================
