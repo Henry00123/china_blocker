@@ -60,7 +60,6 @@ function check_dependencies() {
 }
 
 function ensure_ipset() {
-    # 不使用 ipset restore（你环境的 ipset restore 不支持 exist），只保证集合存在
     ipset create "$IPSET_NAME" hash:net -exist 2>/dev/null || true
 }
 
@@ -227,7 +226,6 @@ function block_port() {
 
     apply_whitelist
 
-    # 避免重复显示：汇总输出
     if [ "${#added_protos[@]}" -gt 0 ]; then
         echo -e "${GREEN}已屏蔽端口 $port（仅中国 IP）: ${added_protos[*]}${NC}"
     fi
@@ -302,7 +300,6 @@ function clean_all() {
     remove_whitelist_rules
 }
 
-# --- systemd 单元/定时器安装 ---
 function install_systemd_units() {
     local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
     local UPDATE_SERVICE_FILE="/etc/systemd/system/${UPDATE_SERVICE_NAME}.service"
@@ -353,7 +350,6 @@ WantedBy=timers.target
 EOF
 }
 
-# --- 自动安装与自我复制 ---
 function install_service() {
     echo -e "${CYAN}正在安装服务...${NC}"
 
@@ -362,7 +358,6 @@ function install_service() {
     mkdir -p "$CONFIG_DIR" 2>/dev/null || true
     touch "$LOG_FILE" 2>/dev/null || true
 
-    # 复制脚本到目标路径
     local SELF
     SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
     if ! cp "$SELF" "$TARGET_PATH" 2>/dev/null; then
@@ -373,7 +368,6 @@ function install_service() {
     chmod +x "$TARGET_PATH"
     echo -e "脚本已部署到: ${GREEN}$TARGET_PATH${NC}"
 
-    # 安装过程中自动更新一次 IP 库，并提示数量
     echo -e "${CYAN}安装过程中自动更新一次 IP 库...${NC}"
     if update_ips; then
         local COUNT
@@ -384,16 +378,13 @@ function install_service() {
         echo -e "${YELLOW}提示：本次自动更新失败（网络或源站问题）。安装仍继续，你可稍后手动更新。${NC}"
     fi
 
-    # 写入 systemd unit + timer
     install_systemd_units
 
     systemctl daemon-reload
 
-    # 开机恢复服务
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
     systemctl start "$SERVICE_NAME" >/dev/null 2>&1
 
-    # 定时更新 timer
     systemctl enable "${UPDATE_TIMER_NAME}.timer" >/dev/null 2>&1
     systemctl start "${UPDATE_TIMER_NAME}.timer" >/dev/null 2>&1
 
@@ -401,7 +392,6 @@ function install_service() {
     echo -e "服务已启动并设置为开机自启。"
     echo -e "${GREEN}现在可直接开始屏蔽端口：菜单选择 3（屏蔽端口）${NC}"
     echo -e "${CYAN}已启用 systemd timer：$ON_CALENDAR 自动更新 IP 库（Persistent=true）${NC}"
-    echo -e "提示：你现在可以删除当前的下载文件，因为脚本已复制到系统目录。"
 }
 
 function uninstall_all() {
@@ -426,7 +416,6 @@ function uninstall_all() {
     exit 0
 }
 
-# ================= 菜单与入口 =================
 function show_menu() {
     clear
     echo -e "${CYAN}==================================${NC}"
@@ -478,7 +467,6 @@ function show_menu() {
 
 check_dependencies
 
-# systemd 调用（在目标路径且有参数）不显示菜单
 if [[ "$0" == "$TARGET_PATH" && -n "$1" ]]; then
     case "$1" in
         --restore) restore_all ;;
