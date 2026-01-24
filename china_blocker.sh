@@ -79,6 +79,7 @@ pkg_install() {
 
 check_dependencies() {
     # 必需：ipset iptables curl awk sed sort uniq
+    # 建议：ca-certificates（HTTPS 证书，Debian/Ubuntu minimal 常缺）
     local need=(ipset iptables curl awk sed sort uniq)
     for cmd in "${need[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -97,6 +98,12 @@ check_dependencies() {
             exit 1
         fi
     done
+
+    # 尝试安装 ca-certificates（若无包管理器或安装失败则忽略）
+    if ! [ -f /etc/ssl/certs/ca-certificates.crt ] && ! [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+        pkg_install ca-certificates >/dev/null 2>&1 || true
+        command -v update-ca-certificates >/dev/null 2>&1 && update-ca-certificates >/dev/null 2>&1 || true
+    fi
 
     if ! command -v systemctl >/dev/null 2>&1; then
         echo -e "${YELLOW}未检测到 systemctl（系统可能非 systemd）。将无法安装为服务/定时器，但仍可手动运行。${NC}"
@@ -189,6 +196,7 @@ restore_all() {
     apply_whitelist
 }
 
+# ✅ 更新 IP：主源 ipdeny + 备用源 APNIC；curl 增加重试/超时；trap 用 RETURN 更安全
 update_ips() {
     echo -e "${CYAN}正在下载并更新 IP 库...${NC}"
     ensure_ipset
@@ -198,36 +206,59 @@ update_ips() {
     local TMP_FILE CLEAN_FILE
     TMP_FILE="$(mktemp)"
     CLEAN_FILE="$(mktemp)"
-    trap 'rm -f "$TMP_FILE" "$CLEAN_FILE"' EXIT
 
-    if ! curl -fsSL -o "$TMP_FILE" "$IP_SOURCE"; then
-        echo -e "${RED}下载失败，请检查网络。${NC}"
-        echo "[$(date)] Update failed: curl error" >> "$LOG_FILE"
-        return 1
+    # 用 RETURN：函数结束就清理临时文件
+    trap 'rm -f "$TMP_FILE" "$CLEAN_FILE"' RETURN
+
+    # NAT 环境更稳：加超时 + 重试
+    local CURL_OPTS=( -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 --retry-all-errors )
+
+    # 1) 主源：ipdeny
+    if ! curl "${CURL_OPTS[@]}" -o "$TMP_FILE" "$IP_SOURCE"; then
+        echo -e "${YELLOW}主源下载失败：$IP_SOURCE，准备切换备用源...${NC}"
+        : > "$TMP_FILE"
     fi
 
-    if ! [ -s "$TMP_FILE" ]; then
-        echo -e "${RED}下载内容为空，已中止更新。${NC}"
-        echo "[$(date)] Update failed: empty content" >> "$LOG_FILE"
-        return 1
+    if [ -s "$TMP_FILE" ]; then
+        # 兼容：一行空格分隔 / 多行分隔
+        tr -s ' \t\r\n' '\n' < "$TMP_FILE" \
+        | awk '
+            /^[ \t]*$/ { next }
+            /^[ \t]*#/ { next }
+            {
+              if ($0 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?$/) print $0
+            }
+        ' > "$CLEAN_FILE"
     fi
 
-    # 兼容：一行空格分隔 / 多行分隔
-    tr -s ' \t\r\n' '\n' < "$TMP_FILE" \
-    | awk '
-        /^[ \t]*$/ { next }
-        /^[ \t]*#/ { next }
-        {
-          if ($0 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?$/) print $0
-        }
-    ' > "$CLEAN_FILE"
+    # 2) 主源解析不到：切换 APNIC 备用源（delegated -> CN ipv4 -> CIDR）
+    if ! [ -s "$CLEAN_FILE" ]; then
+        echo -e "${YELLOW}主源内容无法解析为 CIDR（可能是拦截页/HTML/非预期格式），切换 APNIC 备用源生成 CN IPv4 CIDR...${NC}"
+
+        local APNIC_URL="https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
+        if curl "${CURL_OPTS[@]}" -o "$TMP_FILE" "$APNIC_URL"; then
+            awk -F'|' '
+                function log2(x){ return log(x)/log(2) }
+                $2=="CN" && $3=="ipv4" {
+                    n = log2($5)
+                    if (n == int(n)) {
+                        printf("%s/%d\n", $4, 32-int(n))
+                    }
+                }
+            ' "$TMP_FILE" > "$CLEAN_FILE"
+        fi
+    fi
 
     if ! [ -s "$CLEAN_FILE" ]; then
-        echo -e "${RED}过滤后无有效 IP 段，已中止更新。${NC}"
-        echo "[$(date)] Update failed: no valid cidr after clean" >> "$LOG_FILE"
+        echo -e "${RED}更新失败：仍然没有获得可用的 CIDR 列表。${NC}"
+        echo -e "${YELLOW}建议执行并粘贴输出以定位（是否被拦截/证书/DNS/代理）：${NC}"
+        echo "  curl -v ${IP_SOURCE} -o /tmp/cn.zone 2>&1 | tail -n 30"
+        echo "  head -n 3 /tmp/cn.zone"
+        echo "[$(date)] Update failed: empty cidr list after primary+fallback" >> "$LOG_FILE"
         return 1
     fi
 
+    # 3) 逐条导入临时集合，再 swap（兼容不同 ipset 版本）
     ipset create "$IPSET_TMP" hash:net hashsize 4096 maxelem 1048576 -exist 2>/dev/null || true
     ipset flush "$IPSET_TMP" 2>/dev/null || true
 
