@@ -26,6 +26,9 @@ IP_SOURCE="https://www.ipdeny.com/ipblocks/data/countries/cn.zone"
 # 备用源（仅当主源不可用/不可解析时使用）
 APNIC_URL="https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
 
+# 脚本自身的更新源
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Henry00123/china_blocker/main/china_blocker.sh"
+
 SERVICE_NAME="china_blocker"
 UPDATE_SERVICE_NAME="china_blocker-update"
 UPDATE_TIMER_NAME="china_blocker-update"
@@ -345,6 +348,46 @@ update_ips() {
   return 0
 }
 
+# 脚本自身更新功能
+update_script() {
+  echo -e "${CYAN}正在检查并下载最新脚本...${NC}"
+  if [[ -z "$SCRIPT_UPDATE_URL" || "$SCRIPT_UPDATE_URL" == *"your-username"* ]]; then
+    echo -e "${YELLOW}尚未配置 SCRIPT_UPDATE_URL，请先在脚本顶部的配置区修改为你自己的直链。${NC}"
+    return
+  fi
+
+  local TMP_SCRIPT
+  TMP_SCRIPT="$(mktemp)"
+  trap 'rm -f "$TMP_SCRIPT"' RETURN
+
+  if curl -fsSL --connect-timeout 10 -o "$TMP_SCRIPT" "$SCRIPT_UPDATE_URL"; then
+    # 安全验证：检查下载文件是否是一个有效的 bash 脚本
+    if head -n 1 "$TMP_SCRIPT" | grep -q "#!/bin/bash"; then
+      local SELF
+      SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+      
+      # 覆盖当前运行的脚本
+      if [[ -w "$SELF" ]]; then
+        cat "$TMP_SCRIPT" > "$SELF"
+      fi
+      
+      # 如果已经安装到了 TARGET_PATH，也一并覆盖
+      if [[ "$SELF" != "$TARGET_PATH" && -w "$TARGET_PATH" ]]; then
+        cat "$TMP_SCRIPT" > "$TARGET_PATH"
+        chmod +x "$TARGET_PATH"
+      fi
+
+      echo -e "${GREEN}脚本自更新完成！脚本将自动退出，请重新运行。${NC}"
+      exit 0
+    else
+      echo -e "${RED}下载的文件内容无效（未检测到 #!/bin/bash）。更新失败！${NC}"
+      echo -e "${YELLOW}可能是网络拦截或 URL 错误导致拉取到了 HTML 页面。${NC}"
+    fi
+  else
+    echo -e "${RED}下载失败，请检查网络或 URL 是否正确！${NC}"
+  fi
+}
+
 block_port() {
   echo -n "输入要屏蔽的端口 (如 80): "
   read -r port
@@ -591,6 +634,7 @@ show_menu() {
     echo -e "5. 编辑白名单（vim）"
     echo -e "6. 查看状态"
     echo -e "7. ${RED}卸载服务${NC}"
+    echo -e "99. ${YELLOW}更新脚本${NC}"
     echo -e "0. 退出"
     echo -e "----------------------------------"
     echo -n "请选择: "
@@ -634,6 +678,7 @@ show_menu() {
         get_ipset_count 2>/dev/null || true
         ;;
       7) uninstall_all ;;
+      99) update_script ;;
       0) exit 0 ;;
       *) echo "无效选择" ;;
     esac
