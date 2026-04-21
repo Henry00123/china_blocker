@@ -20,7 +20,7 @@ TARGET_PATH="$INSTALL_DIR/$SCRIPT_NAME"
 CONFIG_DIR="/etc/china_blocker"
 IPSET_CONF="$CONFIG_DIR/ipset.conf"
 WHITELIST_FILE="$CONFIG_DIR/whitelist.txt"
-BLOCKED_PORTS_FILE="$CONFIG_DIR/blocked_ports.txt"  # <--- 新增：端口持久化文件
+BLOCKED_PORTS_FILE="$CONFIG_DIR/blocked_ports.txt"  # <--- 端口持久化文件
 LOG_FILE="/var/log/china_blocker.log"
 
 # 主源（优先）
@@ -254,12 +254,12 @@ looks_like_html() {
 }
 
 # ================= 核心功能函数 =================
-# <--- 新增：保存当前封禁的端口到文件
+# 保存当前封禁的端口到文件
 save_blocked_ports() {
   list_blocked_ports > "$BLOCKED_PORTS_FILE" 2>/dev/null || true
 }
 
-# <--- 新增：从文件恢复封禁的端口规则
+# 从文件恢复封禁的端口规则
 restore_blocked_ports() {
   [ ! -f "$BLOCKED_PORTS_FILE" ] && return 0
   ensure_ipset
@@ -280,7 +280,7 @@ restore_all() {
   restore_ipset_from_conf || true
   ensure_chain
   apply_whitelist
-  restore_blocked_ports  # <--- 修改：重启时恢复封禁端口
+  restore_blocked_ports  # 重启时恢复封禁端口
 }
 
 # ✅ update_ips：ipdeny 优先；只有 ipdeny 失败/解析不到 CIDR 才走 APNIC
@@ -448,7 +448,7 @@ block_port() {
 
   if [ "${#added_protos[@]}" -gt 0 ]; then
     echo -e "${GREEN}已屏蔽端口 $port（仅中国 IP）: ${added_protos[*]}${NC}"
-    save_blocked_ports  # <--- 修改：封禁后保存到文件
+    save_blocked_ports  # 封禁后保存到文件
   fi
   if [ "${#added_protos[@]}" -eq 0 ] && [ "${#existed_protos[@]}" -gt 0 ]; then
     echo -e "${YELLOW}端口 $port 已经处于封禁状态（仅中国 IP）: ${existed_protos[*]}${NC}"
@@ -502,7 +502,7 @@ unblock_port() {
 
   if [ "${#removed_protos[@]}" -gt 0 ]; then
     echo -e "${GREEN}已解封端口 $port: ${removed_protos[*]}${NC}"
-    save_blocked_ports  # <--- 修改：解封后保存到文件
+    save_blocked_ports  # 解封后保存到文件
   else
     echo -e "${YELLOW}端口 $port 未找到对应封禁规则（可能已被删除）。${NC}"
   fi
@@ -521,8 +521,11 @@ clean_all() {
 
   remove_whitelist_rules
   
-  # 清空持久化的端口文件
-  : > "$BLOCKED_PORTS_FILE" 2>/dev/null || true  # <--- 新增：清理时清空端口文件
+  # ============================================================
+  # 核心修复：移除了清空 BLOCKED_PORTS_FILE 的操作
+  # 原代码 : > "$BLOCKED_PORTS_FILE" 2>/dev/null || true
+  # 原因：ExecStop 调用 clean_all 时会清空持久化文件，导致重启后无法恢复
+  # ============================================================
 }
 
 install_systemd_units() {
