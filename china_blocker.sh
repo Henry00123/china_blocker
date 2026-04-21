@@ -517,4 +517,224 @@ clean_all() {
   iptables -X "$CHAIN_NAME" 2>/dev/null || true
 
   ipset destroy "$IPSET_NAME" 2>/dev/null || true
-  ipset destroy "$IPSET_TMP" 2>/dev/null
+  ipset destroy "$IPSET_TMP" 2>/dev/null || true
+
+  remove_whitelist_rules
+  
+  # 清空持久化的端口文件
+  : > "$BLOCKED_PORTS_FILE" 2>/dev/null || true  # <--- 新增：清理时清空端口文件
+}
+
+install_systemd_units() {
+  local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+  local UPDATE_SERVICE_FILE="/etc/systemd/system/${UPDATE_SERVICE_NAME}.service"
+  local UPDATE_TIMER_FILE="/etc/systemd/system/${UPDATE_TIMER_NAME}.timer"
+
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=China IP Blocker Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$TARGET_PATH --restore
+ExecStop=$TARGET_PATH --clean
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > "$UPDATE_SERVICE_FILE" <<EOF
+[Unit]
+Description=China Blocker - Update China IPSet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$TARGET_PATH --update
+StandardOutput=journal
+StandardError=journal
+EOF
+
+  cat > "$UPDATE_TIMER_FILE" <<EOF
+[Unit]
+Description=China Blocker - Monthly Update Timer
+
+[Timer]
+OnCalendar=$ON_CALENDAR
+Persistent=true
+Unit=${UPDATE_SERVICE_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+install_service() {
+  echo -e "${CYAN}正在安装/修复服务...${NC}"
+
+  check_dependencies
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo -e "${RED}未检测到 systemctl（非 systemd 系统），无法安装为服务/定时器。${NC}"
+    echo -e "${YELLOW}你仍可手动运行：sudo ./$SCRIPT_NAME 或 sudo $TARGET_PATH --update${NC}"
+    return
+  fi
+
+  mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  touch "$LOG_FILE" 2>/dev/null || true
+
+  local SELF
+  SELF="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  if ! cp "$SELF" "$TARGET_PATH" 2>/dev/null; then
+    echo -e "${RED}复制脚本失败：无法从 $SELF 复制到 $TARGET_PATH${NC}"
+    echo -e "${YELLOW}如果你是用 bash <(curl ...) 方式运行，请先保存为文件再执行。${NC}"
+    return
+  fi
+  chmod +x "$TARGET_PATH"
+  echo -e "脚本已部署到: ${GREEN}$TARGET_PATH${NC}"
+
+  echo -e "${CYAN}安装过程中自动更新一次 IP 库（ipdeny 优先）...${NC}"
+  if update_ips; then
+    local COUNT
+    COUNT="$(get_ipset_count)"
+    COUNT="${COUNT:-unknown}"
+    echo -e "${GREEN}✅ 更新完成：当前中国 IP 库条目数 = $COUNT${NC}"
+  else
+    echo -e "${YELLOW}提示：本次自动更新失败（网络或源站问题）。安装仍继续，你可稍后手动更新。${NC}"
+  fi
+
+  install_systemd_units
+  systemctl daemon-reload
+
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+  systemctl restart "$SERVICE_NAME" >/dev/null 2>&1
+
+  systemctl enable "${UPDATE_TIMER_NAME}.timer" >/dev/null 2>&1
+  systemctl restart "${UPDATE_TIMER_NAME}.timer" >/dev/null 2>&1
+
+  echo -e "${GREEN}✅ 安装完成！${NC}"
+  echo -e "服务已启动并设置为开机自启。"
+  echo -e "${GREEN}现在可直接开始屏蔽端口：菜单选择 3（屏蔽端口）${NC}"
+  echo -e "${CYAN}已启用 systemd timer：$ON_CALENDAR 自动更新 IP 库（Persistent=true）${NC}"
+}
+
+uninstall_all() {
+  echo -e "${YELLOW}正在卸载...${NC}"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "${UPDATE_TIMER_NAME}.timer" 2>/dev/null || true
+    systemctl disable "${UPDATE_TIMER_NAME}.timer" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${UPDATE_TIMER_NAME}.timer" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${UPDATE_SERVICE_NAME}.service" 2>/dev/null || true
+
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+
+  clean_all
+  rm -rf "$CONFIG_DIR"
+  rm -f "$TARGET_PATH"
+
+  echo -e "${GREEN}卸载完成。${NC}"
+  exit 0
+}
+
+# ================= 菜单（循环返回主菜单） =================
+show_menu() {
+  while true; do
+    clear
+    echo -e "${CYAN}==================================${NC}"
+    echo -e "${CYAN}   🇨🇳 中国 IP 屏蔽助手 (一键版)   ${NC}"
+    echo -e "${CYAN}==================================${NC}"
+    echo -e "1. ${GREEN}安装/修复服务${NC} (推荐，只需运行一次)"
+    echo -e "2. ${YELLOW}更新 IP 库${NC}"
+    echo -e "3. ${RED}屏蔽端口${NC}"
+    echo -e "4. ${GREEN}解封端口${NC}"
+    echo -e "5. 编辑白名单"
+    echo -e "6. 查看状态"
+    echo -e "7. ${RED}卸载服务${NC}"
+    echo -e "99. ${YELLOW}更新脚本${NC}"
+    echo -e "0. 退出"
+    echo -e "----------------------------------"
+    echo -n "请选择: "
+    read -r choice
+
+    case "${choice:-}" in
+      1) install_service ;;
+      2) update_ips ;;
+      3) block_port ;;
+      4) unblock_port ;;
+      5)
+        local ed
+        ed="$(pick_editor)"
+        if [[ "$ed" == "vim" ]]; then
+          vim "$WHITELIST_FILE"
+          apply_whitelist
+        elif [[ -n "$ed" ]]; then
+          echo -e "${YELLOW}未安装 vim，使用 $ed 打开白名单文件。建议安装 vim：${NC}"
+          echo -e "  Debian/Ubuntu: sudo apt-get install -y vim"
+          echo -e "  CentOS/RHEL:   sudo yum/dnf install -y vim-enhanced"
+          "$ed" "$WHITELIST_FILE"
+          apply_whitelist
+        else
+          echo -e "${RED}未找到 vim/vi，无法编辑白名单。请先安装 vim。${NC}"
+        fi
+        ;;
+      6)
+        systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || true
+        echo -e "\n${CYAN}--- timer 状态 ---${NC}"
+        systemctl status "${UPDATE_TIMER_NAME}.timer" --no-pager 2>/dev/null || true
+        echo -e "\n${CYAN}--- 未来计划（systemd timers）---${NC}"
+        systemctl list-timers --all 2>/dev/null | grep -E "${UPDATE_TIMER_NAME}\.timer" || true
+
+        echo -e "\n${CYAN}--- iptables（INPUT 中与本工具相关）---${NC}"
+        iptables -S INPUT | grep -E "$CHAIN_NAME|ACCEPT" || true
+        echo -e "\n${CYAN}--- $CHAIN_NAME 链规则 ---${NC}"
+        iptables -S "$CHAIN_NAME" 2>/dev/null || true
+        echo -e "\n${CYAN}--- 已封禁端口（去重）---${NC}"
+        list_blocked_ports 2>/dev/null || true
+        echo -e "\n${CYAN}--- ipset $IPSET_NAME 条目数 ---${NC}"
+        get_ipset_count 2>/dev/null || true
+        ;;
+      7) uninstall_all ;;
+      99) update_script ;;
+      0) exit 0 ;;
+      *) echo "无效选择" ;;
+    esac
+
+    echo ""
+    read -p "按回车返回主菜单..." _
+  done
+}
+
+# ================= 入口 =================
+check_dependencies
+
+# systemd 调用（在目标路径且有参数）不显示菜单
+if [[ "$0" == "$TARGET_PATH" && -n "${1:-}" ]]; then
+  case "$1" in
+    --restore) restore_all ;;
+    --clean)   clean_all ;;
+    --update)  update_ips ;;
+  esac
+  exit 0
+fi
+
+case "${1:-}" in
+  --install) install_service ;;
+  --update)  update_ips ;;
+  --block)   block_port ;;
+  --restore) restore_all ;;
+  --clean)   clean_all ;;
+  *)         show_menu ;;
+esac
