@@ -508,6 +508,99 @@ unblock_port() {
   fi
 }
 
+# ================= 提取出的新功能函数 =================
+
+# 选项 5: 编辑和应用白名单
+manage_whitelist() {
+  local ed
+  ed="$(pick_editor)"
+  if [[ "$ed" == "vim" ]]; then
+    vim "$WHITELIST_FILE"
+    apply_whitelist
+  elif [[ -n "$ed" ]]; then
+    echo -e "${YELLOW}未安装 vim，使用 $ed 打开白名单文件。建议安装 vim：${NC}"
+    echo -e "  Debian/Ubuntu: sudo apt-get install -y vim"
+    echo -e "  CentOS/RHEL:   sudo yum/dnf install -y vim-enhanced"
+    "$ed" "$WHITELIST_FILE"
+    apply_whitelist
+  else
+    echo -e "${RED}未找到 vim/vi，无法编辑白名单。请先安装 vim。${NC}"
+  fi
+}
+
+# 选项 6: 结构化高亮查看运行状态报告
+show_status_report() {
+  clear
+  echo -e "${CYAN}==================================================${NC}"
+  echo -e "${CYAN}             China Blocker 状态运行报告            ${NC}"
+  echo -e "${CYAN}==================================================${NC}"
+  
+  # 1. 核心服务状态
+  echo -e "${GREEN}[1] 核心服务状态 (systemd)${NC}"
+  if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+      echo -e "  - 防护服务状态 : ${GREEN}● 正在运行 (Active)${NC}"
+  else
+      echo -e "  - 防护服务状态 : ${RED}○ 已停止 (Inactive)${NC}"
+  fi
+  
+  # 2. 定时更新器状态
+  if systemctl is-active "${UPDATE_TIMER_NAME}.timer" >/dev/null 2>&1; then
+      echo -e "  - 定时更新状态 : ${GREEN}● 已启用 (Active)${NC}"
+      
+      # 提取下一次执行时间
+      local next_timer_info
+      next_timer_info=$(systemctl list-timers --all 2>/dev/null | grep "${UPDATE_TIMER_NAME}\.timer")
+      if [ -n "$next_timer_info" ]; then
+          # 清洗多余空格，并提取前两个字段（星期、日期和时间，如：Wed 2026-07-01 04:00:00）
+          local next_trigger
+          next_trigger=$(echo "$next_timer_info" | sed 's/^[ \t]*//;s/[ \t][ \t]*/ /g' | cut -d' ' -f1-3)
+          echo -e "  - 下次更新时间 : ${YELLOW}${next_trigger}${NC}"
+      fi
+  else
+      echo -e "  - 定时更新状态 : ${RED}○ 已禁用 (Inactive)${NC}"
+  fi
+  echo -e "--------------------------------------------------"
+
+  # 3. IP 库条目数
+  echo -e "${GREEN}[2] IP 集合状态 (ipset)${NC}"
+  local ipset_cnt
+  ipset_cnt="$(get_ipset_count 2>/dev/null)"
+  ipset_cnt="${ipset_cnt:-0}"
+  if [ "$ipset_cnt" -gt 0 ]; then
+      echo -e "  - 中国 IPv4 库条目数 : ${GREEN}${ipset_cnt}${NC} 条 CIDR"
+  else
+      echo -e "  - 中国 IPv4 库条目数 : ${RED}0${NC} 条 (警告: 库为空，防护可能未生效！)"
+  fi
+  echo -e "--------------------------------------------------"
+
+  # 4. 白名单 IP 列表
+  echo -e "${GREEN}[3] 当前白名单放行 IP${NC}"
+  local whitelist_ips
+  whitelist_ips=$(grep -vE "^\s*#|^\s*$" "$WHITELIST_FILE" 2>/dev/null)
+  if [ -n "$whitelist_ips" ]; then
+      while read -r ip; do
+          echo -e "  - ${CYAN}${ip}${NC}"
+      done <<< "$whitelist_ips"
+  else
+      echo -e "  - ${YELLOW}[当前无白名单 IP]${NC}"
+  fi
+  echo -e "--------------------------------------------------"
+
+  # 5. 已封禁端口
+  echo -e "${GREEN}[4] 已封禁的端口 (中国 IP 命中将 DROP)${NC}"
+  mapfile -t blocked_ports_list < <(list_blocked_ports 2>/dev/null)
+  if [ "${#blocked_ports_list[@]}" -gt 0 ]; then
+      echo -ne "  - 已封禁端口 : "
+      for port_item in "${blocked_ports_list[@]}"; do
+          echo -ne "${RED}[${port_item}]${NC} "
+      done
+      echo ""
+  else
+      echo -e "  - 已封禁端口 : ${YELLOW}[当前未封禁任何端口]${NC}"
+  fi
+  echo -e "${CYAN}==================================================${NC}"
+}
+
 clean_all() {
   while iptables -C INPUT -j "$CHAIN_NAME" 2>/dev/null; do
     iptables -D INPUT -j "$CHAIN_NAME" 2>/dev/null || break
@@ -520,12 +613,6 @@ clean_all() {
   ipset destroy "$IPSET_TMP" 2>/dev/null || true
 
   remove_whitelist_rules
-  
-  # ============================================================
-  # 核心修复：移除了清空 BLOCKED_PORTS_FILE 的操作
-  # 原代码 : > "$BLOCKED_PORTS_FILE" 2>/dev/null || true
-  # 原因：ExecStop 调用 clean_all 时会清空持久化文件，导致重启后无法恢复
-  # ============================================================
 }
 
 install_systemd_units() {
@@ -677,38 +764,8 @@ show_menu() {
       2) update_ips ;;
       3) block_port ;;
       4) unblock_port ;;
-      5)
-        local ed
-        ed="$(pick_editor)"
-        if [[ "$ed" == "vim" ]]; then
-          vim "$WHITELIST_FILE"
-          apply_whitelist
-        elif [[ -n "$ed" ]]; then
-          echo -e "${YELLOW}未安装 vim，使用 $ed 打开白名单文件。建议安装 vim：${NC}"
-          echo -e "  Debian/Ubuntu: sudo apt-get install -y vim"
-          echo -e "  CentOS/RHEL:   sudo yum/dnf install -y vim-enhanced"
-          "$ed" "$WHITELIST_FILE"
-          apply_whitelist
-        else
-          echo -e "${RED}未找到 vim/vi，无法编辑白名单。请先安装 vim。${NC}"
-        fi
-        ;;
-      6)
-        systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || true
-        echo -e "\n${CYAN}--- timer 状态 ---${NC}"
-        systemctl status "${UPDATE_TIMER_NAME}.timer" --no-pager 2>/dev/null || true
-        echo -e "\n${CYAN}--- 未来计划（systemd timers）---${NC}"
-        systemctl list-timers --all 2>/dev/null | grep -E "${UPDATE_TIMER_NAME}\.timer" || true
-
-        echo -e "\n${CYAN}--- iptables（INPUT 中与本工具相关）---${NC}"
-        iptables -S INPUT | grep -E "$CHAIN_NAME|ACCEPT" || true
-        echo -e "\n${CYAN}--- $CHAIN_NAME 链规则 ---${NC}"
-        iptables -S "$CHAIN_NAME" 2>/dev/null || true
-        echo -e "\n${CYAN}--- 已封禁端口（去重）---${NC}"
-        list_blocked_ports 2>/dev/null || true
-        echo -e "\n${CYAN}--- ipset $IPSET_NAME 条目数 ---${NC}"
-        get_ipset_count 2>/dev/null || true
-        ;;
+      5) manage_whitelist ;;
+      6) show_status_report ;;
       7) uninstall_all ;;
       99) update_script ;;
       0) exit 0 ;;
