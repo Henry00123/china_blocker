@@ -95,12 +95,11 @@ sudo vim /etc/china_blocker/whitelist.txt
 
 菜单选择 `6` 会显示：
 
-- `china_blocker.service` 状态
-- `china_blocker-update.timer` 状态与下次触发时间
-- INPUT 链是否已跳转到 `CHINA_BLOCKER`
-- `CHINA_BLOCKER` 链规则
-- 已封禁端口列表
-- `ipset china_ips` 条目数
+- **核心服务状态**：`china_blocker.service` 防护服务的运行状态（Active / Inactive）。
+- **定时更新状态**：`china_blocker-update.timer` 定时更新器的状态及下一次精确触发时间。
+- **IP 集合状态**：`ipset china_ips` 中国 IPv4 库当前加载的 CIDR 总条目数。
+- **白名单放行 IP**：当前配置并生效的白名单 IP 列表（无数据时贴心提示 `[当前无白名单 IP]`）。
+- **已封禁端口**：当前正在针对中国 IP 封禁的高亮端口列表（TCP/UDP）。
 
 你也可以手动查看：
 
